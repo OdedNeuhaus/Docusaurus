@@ -10,8 +10,8 @@ import {themes as prismThemes} from 'prism-react-renderer';
 
 /** @type {import('@docusaurus/types').Config} */
 const config = {
-  title: 'My Site',
-  tagline: 'Dinosaurs are cool',
+  title: 'Simple Documentation',
+  tagline: 'Simple Documentation',
   favicon: 'img/favicon.ico',
 
   // Future flags, see https://docusaurus.io/docs/api/docusaurus-config#future
@@ -35,9 +35,15 @@ const config = {
   // Even if you don't use internationalization, you can use this field to set
   // useful metadata like html lang. For example, if your site is Chinese, you
   // may want to replace "en" with "zh-Hans".
+  // Internationalization configuration
   i18n: {
-    defaultLocale: 'en',
-    locales: ['en'],
+    defaultLocale: 'he',
+    locales: ['he'],
+    localeConfigs: {
+      he: {
+        direction: 'rtl',
+      },
+    },
   },
 
   presets: [
@@ -86,7 +92,7 @@ const config = {
         respectPrefersColorScheme: true,
       },
       navbar: {
-        title: 'My Site',
+        title: 'Simple Documentation',
         logo: {
           alt: 'My Site Logo',
           src: 'img/logo.svg',
@@ -96,7 +102,7 @@ const config = {
             type: 'docSidebar',
             sidebarId: 'tutorialSidebar',
             position: 'left',
-            label: 'Tutorial',
+            label: 'docs',
           },
           {to: '/blog', label: 'Blog', position: 'left'},
           {
@@ -110,7 +116,7 @@ const config = {
         style: 'dark',
         // Remove all footer links; keep a simple copyright line
         links: [],
-        copyright: `© ${new Date().getFullYear()} כל הזכויות שמורות לצוות Watson`,
+        copyright: `© כל הזכויות שמורות לצוות Watson`,
       },
       prism: {
         theme: prismThemes.github,
