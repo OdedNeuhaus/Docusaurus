@@ -1,0 +1,71 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "query-rate-limit-proxy.fullname" . }}
+  labels:
+    {{- include "query-rate-limit-proxy.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "query-rate-limit-proxy.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "query-rate-limit-proxy.selectorLabels" . | nindent 8 }}
+    spec:
+      shareProcessNamespace: true
+      containers:
+        - name: nginx
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: {{ .Values.healthCheck.path | default "/_health" }}
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: {{ .Values.healthCheck.path | default "/_health" }}
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: nginx-config
+              mountPath: /etc/nginx/
+
+        - name: config-reloader
+          image: "{{ .Values.configReloader.image.repository }}:{{ .Values.configReloader.image.tag }}"
+          command:
+            - /bin/sh
+            - -c
+            - |
+              apk add --no-cache inotify-tools nginx > /dev/null 2>&1
+              echo "Config reloader started, watching /etc/nginx for changes..."
+              while true; do
+                inotifywait -r -e modify,create,delete /etc/nginx 2>/dev/null
+                echo "Config change detected, validating..."
+                if nginx -t 2>&1; then
+                  echo "Config valid, reloading nginx..."
+                  nginx -s reload 2>&1 || true
+                else
+                  echo "ERROR: Invalid nginx config, skipping reload" >&2
+                fi
+              done
+          resources:
+            {{- toYaml .Values.configReloader.resources | nindent 12 }}
+          volumeMounts:
+            - name: nginx-config
+              mountPath: /etc/nginx/
+
+      volumes:
+        - name: nginx-config
+          configMap:
+            name: {{ include "query-rate-limit-proxy.fullname" . }}-config
