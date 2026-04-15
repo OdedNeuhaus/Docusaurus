@@ -1,0 +1,41 @@
+# Internal Systems Investigation Runbook
+
+When the user asks about a "system" or "מערכת" — or mentions any service/application name you do not recognize — follow this runbook. These are proprietary internal systems in an air-gapped environment. You have NO prior knowledge about them. Do NOT guess or hallucinate.
+
+## Investigation Flow
+
+1. **Identify the system name** from the user's question, alert, or labels.
+2. **Check if the system is listed below** in the Known Systems section. If it is, go directly to the specified sources. If not, proceed to step 3.
+3. **Search for documentation** using the Confluence and GitLab MCP tools:
+   - Search Confluence for the system name. Look for pages titled with the system name, or containing "runbook", "architecture", "troubleshooting", or "operations" alongside the system name.
+   - Search GitLab for a project matching the system name. Once found, read the README.md first, then check for a docs/ directory.
+4. **Read the source code** in the GitLab repository you found:
+   - Configuration files (config/, .env.example, settings).
+   - If the issue involves a specific error, search the codebase for that error string.
+   - Deployment manifests (Kubernetes YAML, Dockerfiles, Helm charts).
+5. **Correlate and answer**: combine documentation and source code with any observability data (logs, metrics, events). Cite which documents and files informed your analysis. If you could not find documentation, say so explicitly — do not fabricate.
+
+---
+
+## Known Systems
+
+<!-- TEMPLATE — copy this block for each system you want to register:
+
+### [System Name]
+- **Confluence**: space `SPACE_KEY`, page "Page Title"
+- **GitLab project**: `group/project-name`
+- **Key paths**: docs/, config/, src/
+- **Notes**: any extra context for Holmes
+-->
+
+### Payment Service
+- **Confluence**: space `ENG`, page "Payment Service"
+- **GitLab project**: `backend/payment-service`
+- **Key paths**: docs/, src/config/
+- **Notes**: check child pages in Confluence for troubleshooting guides
+
+### Auth Service
+- **Confluence**: none — docs live in the repo
+- **GitLab project**: `platform/auth-service`
+- **Key paths**: docs/README.md, docs/architecture.md, src/middleware/
+- **Notes**: for auth failures check OAuth/OIDC config files
