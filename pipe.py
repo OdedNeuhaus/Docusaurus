@@ -287,6 +287,9 @@ class Pipe:
             req_headers.update(extra_headers)
 
         trace_id = (extra_headers or {}).get("trace_id")
+        thinking = True  # Track whether we're still in the <think> block
+
+        yield "<think>"
 
         try:
             async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -296,9 +299,6 @@ class Pipe:
                     buffer = b""
                     current_event: Optional[str] = None
                     data_lines: list[str] = []
-                    thinking = True  # Track whether we're still in the <think> block
-
-                    yield "<think>"
 
                     def flush_event() -> tuple[list[str], bool]:
                         nonlocal current_event, data_lines, thinking
