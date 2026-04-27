@@ -1,0 +1,204 @@
+"""HolmesGPT Pipe Function"""
+
+import aiohttp
+import json
+from typing import AsyncGenerator
+from pydantic import BaseModel, Field
+
+
+class Pipe:
+    class Valves(BaseModel):
+        HOLMESGPT_URL: str = Field(
+            default="http://holmesgpt-holmes",
+            description="Base URL of holmesgpt server",
+        )
+        MODELS_LIST: list[str] = Field(
+            default=["watsonteam", "uscarlet", "uindigo"],
+            description="HolmesGPT model list",
+        )
+        GENERIC_MODEL_NAME: str = Field(
+            default="generic",
+            description="HolmesGPT generic model name",
+        )
+        LANGFUSE_TAGS: list[str] = Field(
+            default=["openwebui", "holmesgpt"],
+            description="Tags applied to every Langfuse trace",
+        )
+
+    def __init__(self):
+        self.valves = self.Valves()
+
+    def pipes(self):
+        return [{"id": "holmesgpt", "name": "HolmesGPT"}]
+
+    async def pipe(
+        self,
+        body: dict,
+        __user__: dict = None,
+        __metadata__: dict = None,
+    ):
+        messages = body.get("messages", [])
+        conversation_history = None
+        if len(messages) > 1:
+            conversation_history = []
+            for msg in messages[:-1]:
+                conversation_history.append(
+                    {"role": msg["role"], "content": msg["content"]}
+                )
+
+        ask = messages[-1]["content"] if messages else ""
+        stream = body.get("stream", False)
+
+        # --- Langfuse correlation ---------------------------------------
+        # OpenWebUI passes chat_id/message_id either in __metadata__ or
+        # body["metadata"] depending on version. Try both.
+        owui_meta = __metadata__ or body.get("metadata") or {}
+        chat_id = owui_meta.get("chat_id")
+        message_id = owui_meta.get("message_id")
+
+        user_email = (__user__ or {}).get("email")
+        user_id = (__user__ or {}).get("id") or user_email
+
+        trace_metadata = {
+            # session_id groups all turns of one OpenWebUI chat as one Langfuse session
+            "session_id": chat_id,
+            # trace_user_id ties traces to a person
+            "trace_user_id": user_id,
+            # one trace per user turn — message_id is unique per turn
+            "trace_name": f"holmes-{message_id}" if message_id else "holmes",
+            "tags": list(self.valves.LANGFUSE_TAGS),
+            # passthrough for debugging
+            "owui_chat_id": chat_id,
+            "owui_message_id": message_id,
+            "owui_user_email": user_email,
+        }
+        # drop None values so LiteLLM/Langfuse don't see empty strings
+        trace_metadata = {k: v for k, v in trace_metadata.items() if v}
+        # ----------------------------------------------------------------
+
+        payload = {
+            "ask": ask,
+            "stream": stream,
+            "model": self.valves.GENERIC_MODEL_NAME,
+            # NOTE: HolmesGPT must be patched to forward this into
+            # litellm.completion(metadata=...). Without that patch, this
+            # field is silently ignored and Langfuse will not see sessions.
+            "trace_metadata": trace_metadata,
+        }
+
+        if conversation_history:
+            if conversation_history[0]["role"] != "system":
+                conversation_history.insert(
+                    0,
+                    {
+                        "role": "system",
+                        "content": "You are a helpful kubernetes troubleshooting assistant",
+                    },
+                )
+            payload["conversation_history"] = conversation_history
+
+        if __user__:
+            username = (user_email or "").split("@")[0]
+            if username in self.valves.MODELS_LIST:
+                payload["model"] = username
+
+        url = f"{self.valves.HOLMESGPT_URL}/api/chat"
+
+        # Belt-and-braces: also send as headers, in case you patch
+        # HolmesGPT to forward them via litellm's extra_headers.
+        # LiteLLM proxy reads these natively when present.
+        headers = {}
+        if chat_id:
+            headers["langfuse_session_id"] = chat_id
+        if user_id:
+            headers["langfuse_trace_user_id"] = str(user_id)
+        if message_id:
+            headers["langfuse_trace_id"] = self._to_langfuse_trace_id(message_id)
+
+        if stream:
+            return self._stream(url, payload, headers)
+        else:
+            return await self._non_stream(url, payload, headers)
+
+    @staticmethod
+    def _to_langfuse_trace_id(value: str) -> str:
+        """Langfuse expects a 32-char hex trace_id. Hash arbitrary IDs into that shape."""
+        import hashlib
+        return hashlib.sha256(value.encode()).hexdigest()[:32]
+
+    async def _non_stream(self, url: str, payload: dict, headers: dict):
+        timeout = aiohttp.ClientTimeout(total=1800)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(url, json=payload, headers=headers) as resp:
+                resp.raise_for_status()
+                text = await resp.text()
+
+                reasoning = None
+                analysis = None
+                current_event = None
+
+                for line in text.split("\n"):
+                    if line and line.startswith("event: "):
+                        current_event = line[7:].strip()
+                    elif line and line.startswith("data: "):
+                        data = line[6:].strip()
+                        if data == "[DONE]":
+                            break
+                        try:
+                            event_data = json.loads(data)
+                            if current_event == "ai_message":
+                                reasoning = event_data.get("reasoning", "")
+                            elif current_event == "ai_answer_end":
+                                analysis = event_data.get("analysis")
+                                break
+                        except json.JSONDecodeError:
+                            continue
+                    elif line.strip() == "":
+                        current_event = None
+
+                if analysis:
+                    if reasoning:
+                        return f"{reasoning}\n\n{analysis}"
+                    return analysis
+                return "Error: No analysis found in HolmesGPT response"
+
+    async def _stream(self, url: str, payload: dict, headers: dict) -> AsyncGenerator[str, None]:
+        timeout = aiohttp.ClientTimeout(total=1800)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(url, json=payload, headers=headers) as resp:
+                resp.raise_for_status()
+
+                buffer = b""
+                current_event = None
+                thinking = True
+                yield "<think>"
+
+                async for chunk in resp.content.iter_any():
+                    buffer += chunk
+                    while b"\n" in buffer:
+                        line_bytes, buffer = buffer.split(b"\n", 1)
+                        line = line_bytes.decode("utf-8").strip()
+                        if not line:
+                            current_event = None
+                            continue
+                        if line.startswith("event: "):
+                            current_event = line[7:].strip()
+                        elif line.startswith("data: "):
+                            chunk_data = line[6:].strip()
+                            if chunk_data == "[DONE]":
+                                break
+                            try:
+                                event_data = json.loads(chunk_data)
+                                if current_event == "ai_message":
+                                    reasoning = event_data.get("reasoning", "")
+                                    if reasoning and thinking:
+                                        yield f"{reasoning}\n\n"
+                                elif current_event == "ai_answer_end":
+                                    analysis = event_data.get("analysis")
+                                    if analysis:
+                                        thinking = False
+                                        yield "</think>\n\n"
+                                        yield analysis
+                                        break
+                            except json.JSONDecodeError:
+                                continue
