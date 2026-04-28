@@ -2,6 +2,7 @@
 
 import aiohttp
 import json
+import uuid
 from typing import AsyncGenerator
 from pydantic import BaseModel, Field
 
@@ -99,8 +100,14 @@ class Pipe:
             __session_id__,
             __metadata__,
         )
+        message_id = self._clean_langfuse_value(__message_id__) or self._clean_langfuse_value(
+            body.get("message_id")
+        )
+        trace_id = message_id or str(uuid.uuid4())
+
         metadata = {
             "session_id": session_id,
+            "trace_id": trace_id,
             "trace_name": "openwebui-holmesgpt-chat",
             "tags": ["openwebui", "holmesgpt"],
             "trace_metadata": {
@@ -113,7 +120,6 @@ class Pipe:
         if user_id:
             metadata["trace_user_id"] = user_id
 
-        message_id = self._clean_langfuse_value(__message_id__)
         if message_id:
             metadata["trace_metadata"]["openwebui_message_id"] = message_id
 
