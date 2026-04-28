@@ -38,15 +38,29 @@ class Pipe:
 
         return cleaned[:199]
 
-    def _get_session_id(self, body: dict, __user__: dict | None = None) -> str:
+    def _get_session_id(
+        self,
+        body: dict,
+        __user__: dict | None = None,
+        __chat_id__: str | None = None,
+        __session_id__: str | None = None,
+        __metadata__: dict | None = None,
+    ) -> str:
+        metadata = __metadata__ if isinstance(__metadata__, dict) else {}
+        body_metadata = (
+            body.get("metadata", {}) if isinstance(body.get("metadata"), dict) else {}
+        )
+
         session_candidates = [
+            __chat_id__,
+            metadata.get("chat_id"),
             body.get("chat_id"),
+            body_metadata.get("chat_id"),
+            __session_id__,
+            metadata.get("session_id"),
             body.get("conversation_id"),
             body.get("session_id"),
             body.get("id"),
-            body.get("metadata", {}).get("chat_id")
-            if isinstance(body.get("metadata"), dict)
-            else None,
         ]
 
         for candidate in session_candidates:
@@ -69,9 +83,24 @@ class Pipe:
 
         return None
 
-    def _build_langfuse_metadata(self, body: dict, __user__: dict | None = None) -> dict:
+    def _build_langfuse_metadata(
+        self,
+        body: dict,
+        __user__: dict | None = None,
+        __chat_id__: str | None = None,
+        __session_id__: str | None = None,
+        __metadata__: dict | None = None,
+        __message_id__: str | None = None,
+    ) -> dict:
+        session_id = self._get_session_id(
+            body,
+            __user__,
+            __chat_id__,
+            __session_id__,
+            __metadata__,
+        )
         metadata = {
-            "session_id": self._get_session_id(body, __user__),
+            "session_id": session_id,
             "trace_name": "openwebui-holmesgpt-chat",
             "tags": ["openwebui", "holmesgpt"],
             "trace_metadata": {
@@ -83,6 +112,10 @@ class Pipe:
         user_id = self._get_user_id(__user__)
         if user_id:
             metadata["trace_user_id"] = user_id
+
+        message_id = self._clean_langfuse_value(__message_id__)
+        if message_id:
+            metadata["trace_metadata"]["openwebui_message_id"] = message_id
 
         return metadata
 
@@ -102,7 +135,15 @@ class Pipe:
 
         return headers
 
-    async def pipe(self, body: dict, __user__: dict = None):
+    async def pipe(
+        self,
+        body: dict,
+        __user__: dict = None,
+        __metadata__: dict = None,
+        __chat_id__: str = None,
+        __session_id__: str = None,
+        __message_id__: str = None,
+    ):
         messages = body.get("messages", [])
         conversation_history = None
         if len(messages) > 1:
@@ -124,7 +165,14 @@ class Pipe:
             "model": self.valves.GENERIC_MODEL_NAME,
         }
 
-        langfuse_metadata = self._build_langfuse_metadata(body, __user__)
+        langfuse_metadata = self._build_langfuse_metadata(
+            body,
+            __user__,
+            __chat_id__,
+            __session_id__,
+            __metadata__,
+            __message_id__,
+        )
         payload["metadata"] = langfuse_metadata
         payload["user_id"] = langfuse_metadata.get("trace_user_id")
 
