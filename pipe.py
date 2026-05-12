@@ -11,16 +11,16 @@ from pydantic import BaseModel, Field
 class Pipe:
     class Valves(BaseModel):
         HOLMESGPT_URL: str = Field(
-            default="https://holmesgpt-holmes",
-            description="Base URL of holmesgpt server"
+            default="http://holmesgpt-holmes",
+            description="Base URL of holmesgpt server",
         )
         MODEL_LIST: list[str] = Field(
             default=["watsonteam", "uscarlet", "uindigo"],
-            description="HolmesGPT model list"
+            description="HolmesGPT model list",
         )
         GENERIC_MODEL_NAME: str = Field(
             default="generic",
-            description="HolmesGPT generic model name"
+            description="HolmesGPT generic model name",
         )
 
     def __init__(self):
@@ -29,35 +29,60 @@ class Pipe:
     def pipes(self):
         return [{"id": "holmesgpt", "name": "HolmesGPT"}]
 
-    def _build_trace_headers(self, body: dict, __user__: dict = None) -> dict:
-        """Build Langfuse tracing headers."""
-        trace_id = str(uuid.uuid4())
-        session_id = body.get("chat_id", str(uuid.uuid4()))
+    def _build_langfuse_metadata(self, body: dict, __user__: dict = None) -> dict:
+        """Build Langfuse session/user metadata sent in the HolmesGPT payload."""
+        session_id = (
+            body.get("chat_id")
+            or body.get("conversation_id")
+            or str(uuid.uuid4())
+        )
 
-        headers = {
-            "trace_id": trace_id,
+        metadata = {
             "session_id": session_id,
+            "trace_id": str(uuid.uuid4()),
             "trace_name": "holmesgpt-chat",
         }
 
         if __user__:
-            trace_user_id = __user__.get("email") or __user__.get("name") or __user__.get("id")
+            trace_user_id = (
+                __user__.get("name")
+                or __user__.get("email")
+                or __user__.get("id")
+            )
             if trace_user_id:
-                headers["trace_user_id"] = trace_user_id
+                metadata["trace_user_id"] = trace_user_id
+
+        return metadata
+
+    @staticmethod
+    def _headers_from_metadata(metadata: dict) -> dict:
+        """Mirror the Langfuse metadata into proxy-safe HTTP headers.
+
+        Underscore headers (e.g. `session_id`) are stripped by nginx and many
+        other proxies by default, so the JSON payload is the source of truth
+        and these headers are only a supplemental fallback.
+        """
+        headers = {
+            "X-Session-Id": metadata["session_id"],
+            "langfuse_session_id": metadata["session_id"],
+        }
+
+        trace_user_id = metadata.get("trace_user_id")
+        if trace_user_id:
+            headers["X-User-Id"] = trace_user_id
+            headers["langfuse_trace_user_id"] = trace_user_id
 
         return headers
 
     async def pipe(self, body: dict, __user__: dict = None):
         messages = body.get("messages", [])
         conversation_history = None
+
         if len(messages) > 1:
             conversation_history = []
             for msg in messages[:-1]:
                 conversation_history.append(
-                    {
-                        "role": msg["role"],
-                        "content": msg["content"]
-                    }
+                    {"role": msg["role"], "content": msg["content"]}
                 )
 
         ask = messages[-1]["content"] if messages else ""
@@ -66,7 +91,7 @@ class Pipe:
         payload = {
             "ask": ask,
             "stream": stream,
-            "model": self.valves.GENERIC_MODEL_NAME
+            "model": self.valves.GENERIC_MODEL_NAME,
         }
 
         if conversation_history:
@@ -75,9 +100,10 @@ class Pipe:
                     0,
                     {
                         "role": "system",
-                        "content": "You are a helpful kubernetes troubleshooting assistant"
-                    }
+                        "content": "You are a helpful kubernetes troubleshooting assistant",
+                    },
                 )
+
             payload["conversation_history"] = conversation_history
 
         if __user__:
@@ -85,18 +111,29 @@ class Pipe:
             if username in self.valves.MODEL_LIST:
                 payload["model"] = username
 
+        langfuse_metadata = self._build_langfuse_metadata(body, __user__)
+        payload["metadata"] = langfuse_metadata
+        if langfuse_metadata.get("trace_user_id"):
+            payload["user_id"] = langfuse_metadata["trace_user_id"]
+
         url = f"{self.valves.HOLMESGPT_URL}/api/chat"
-        headers = self._build_trace_headers(body, __user__)
+        headers = self._headers_from_metadata(langfuse_metadata)
 
         if stream:
             return self._stream(url, payload, headers)
         else:
             return await self._non_stream(url, payload, headers)
 
-    async def _non_stream(self, url: str, payload: dict, extra_headers: dict = None):
-        """Handle non-streaming response"""
+    async def _non_stream(
+        self,
+        url: str,
+        payload: dict,
+        extra_headers: dict = None,
+    ):
+        """Handle non-streaming response."""
         timeout = aiohttp.ClientTimeout(total=1800)
         req_headers = {"Content-Type": "application/json"}
+
         if extra_headers:
             req_headers.update(extra_headers)
 
@@ -115,26 +152,35 @@ class Pipe:
                 for line in lines:
                     if line and line.startswith("event: "):
                         current_event = line[7:].strip()
+
                     elif line and line.startswith("data: "):
                         data = line[6:].strip()
+
                         if data == "[DONE]":
                             break
+
                         try:
                             event_data = json.loads(data)
+
                             if current_event == "ai_message":
                                 reasoning = event_data.get("reasoning", "")
+
                             elif current_event == "ai_answer_end":
                                 analysis = event_data.get("analysis")
                                 break
+
                         except json.JSONDecodeError:
                             continue
+
                     elif line.strip() == "":
                         current_event = None
 
                 if analysis:
                     if reasoning:
                         return f"{reasoning}\n\n{analysis}"
+
                     return analysis
+
                 return "Error: No analysis found in HolmesGPT response"
 
     @staticmethod
@@ -144,8 +190,9 @@ class Pipe:
         params: dict,
         result_text: str,
     ) -> str:
-        """Render a HolmesGPT tool result as Open WebUI's standard
-        ``<details type="tool_calls">`` block. The Holmes PromQL placeholder
+        """
+        Render a HolmesGPT tool result as Open WebUI's standard
+        `<details type="tool_calls">` block. The Holmes PromQL placeholder
         resolver in the frontend reads these blocks to surface charts.
         """
         try:
@@ -168,19 +215,17 @@ class Pipe:
             f'name="{html.escape(tool_name or "", quote=True)}" '
             f'arguments="{html.escape(arguments_json, quote=True)}" '
             f'result="{html.escape(result_attr, quote=True)}">\n'
-            f'<summary>Tool Executed</summary>\n'
-            f'</details>\n'
+            f"<summary>Tool Executed</summary>\n"
+            f"</details>\n"
         )
 
     @staticmethod
     def _extract_tool_call_output(event_data: dict) -> tuple[str, str, dict, str]:
-        """Pull out (tool_call_id, tool_name, params, stringified_result)
-        from a HolmesGPT ``tool_calling_result`` SSE event payload."""
-        tool_call_id = (
-            event_data.get("tool_call_id")
-            or event_data.get("id")
-            or ""
-        )
+        """
+        Pull out (tool_call_id, tool_name, params, stringifyed_result)
+        from a HolmesGPT `tool_calling_result` SSE event payload.
+        """
+        tool_call_id = event_data.get("tool_call_id") or event_data.get("id") or ""
         tool_name = event_data.get("tool_name") or event_data.get("name") or ""
 
         result = event_data.get("result") or {}
@@ -195,11 +240,13 @@ class Pipe:
         # `get_stringified_data()` so this is already a JSON string when
         # present. Fall back to dumping the full result for error responses.
         result_text = result.get("data")
+
         if result_text in (None, ""):
             try:
                 result_text = json.dumps(result, ensure_ascii=False)
             except (TypeError, ValueError):
                 result_text = str(result)
+
         elif not isinstance(result_text, str):
             try:
                 result_text = json.dumps(result_text, ensure_ascii=False)
@@ -214,21 +261,24 @@ class Pipe:
         payload: dict,
         extra_headers: dict = None,
     ) -> AsyncGenerator[str, None]:
-        """Handle streaming response.
+        """
+        Handle streaming response.
 
         Captures HolmesGPT's tool_calling_result SSE events and surfaces them
-        to Open WebUI as inline ``<details type="tool_calls">`` blocks so the
-        frontend PromQL graph resolver (see ``src/lib/utils/holmesPromql.ts``)
-        can match the embedded ``<<{...}>>`` placeholders by tool_call_id.
+        to Open WebUI as inline `<details type="tool_calls">` blocks so the
+        frontend PromQL graph resolver can match the embedded `<<{{...}}>>`
+        placeholders by tool_call_id.
         """
         timeout = aiohttp.ClientTimeout(total=1800)
         req_headers = {"Content-Type": "application/json"}
+
         if extra_headers:
             req_headers.update(extra_headers)
 
         # Accumulate tool results until we're ready to flush them after
         # </think>. Order is preserved via insertion order of the dict.
         tool_results: dict[str, str] = {}
+
         # Track tool_name from start_tool_calling so we can fall back if the
         # result event omits it.
         pending_tool_starts: dict[str, str] = {}
@@ -240,6 +290,7 @@ class Pipe:
                 buffer = b""
                 current_event = None
                 thinking = True
+
                 yield "<think>"
 
                 async for chunk in resp.content.iter_any():
@@ -255,8 +306,10 @@ class Pipe:
 
                         if line.startswith("event: "):
                             current_event = line[7:].strip()
+
                         elif line.startswith("data: "):
                             chunk_data = line[6:].strip()
+
                             if chunk_data == "[DONE]":
                                 break
 
@@ -267,6 +320,7 @@ class Pipe:
 
                             if current_event == "ai_message":
                                 reasoning = event_data.get("reasoning", "")
+
                                 if reasoning and thinking:
                                     yield f"{reasoning}\n\n"
 
@@ -277,6 +331,7 @@ class Pipe:
                                     or event_data.get("tool_call_id")
                                     or ""
                                 )
+
                                 if tool_call_id:
                                     pending_tool_starts[tool_call_id] = tool_name
 
@@ -291,9 +346,9 @@ class Pipe:
                                 if not tool_call_id:
                                     continue
 
-                                tool_name = (
-                                    tool_name
-                                    or pending_tool_starts.get(tool_call_id, "")
+                                tool_name = tool_name or pending_tool_starts.get(
+                                    tool_call_id,
+                                    "",
                                 )
                                 pending_tool_starts.pop(tool_call_id, None)
 
@@ -308,6 +363,7 @@ class Pipe:
 
                             elif current_event == "ai_answer_end":
                                 analysis = event_data.get("analysis")
+
                                 if analysis is not None:
                                     thinking = False
                                     yield "</think>\n\n"
