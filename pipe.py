@@ -29,48 +29,23 @@ class Pipe:
     def pipes(self):
         return [{"id": "holmesgpt", "name": "HolmesGPT"}]
 
-    def _build_langfuse_metadata(self, body: dict, __user__: dict = None) -> dict:
-        """Build Langfuse session/user metadata sent in the HolmesGPT payload."""
-        session_id = (
-            body.get("chat_id")
-            or body.get("conversation_id")
-            or str(uuid.uuid4())
-        )
+    def _build_trace_headers(self, body: dict, __user__: dict = None) -> dict:
+        """Build Langfuse tracing headers."""
+        trace_id = str(uuid.uuid4())
+        session_id = body.get("chat_id", str(uuid.uuid4()))
 
-        metadata = {
+        headers = {
+            "trace_id": trace_id,
             "session_id": session_id,
-            "trace_id": str(uuid.uuid4()),
             "trace_name": "holmesgpt-chat",
         }
 
         if __user__:
             trace_user_id = (
-                __user__.get("name")
-                or __user__.get("email")
-                or __user__.get("id")
+                __user__.get("name") or __user__.get("email") or __user__.get("id")
             )
             if trace_user_id:
-                metadata["trace_user_id"] = trace_user_id
-
-        return metadata
-
-    @staticmethod
-    def _headers_from_metadata(metadata: dict) -> dict:
-        """Mirror the Langfuse metadata into proxy-safe HTTP headers.
-
-        Underscore headers (e.g. `session_id`) are stripped by nginx and many
-        other proxies by default, so the JSON payload is the source of truth
-        and these headers are only a supplemental fallback.
-        """
-        headers = {
-            "X-Session-Id": metadata["session_id"],
-            "langfuse_session_id": metadata["session_id"],
-        }
-
-        trace_user_id = metadata.get("trace_user_id")
-        if trace_user_id:
-            headers["X-User-Id"] = trace_user_id
-            headers["langfuse_trace_user_id"] = trace_user_id
+                headers["trace_user_id"] = trace_user_id
 
         return headers
 
@@ -111,13 +86,8 @@ class Pipe:
             if username in self.valves.MODEL_LIST:
                 payload["model"] = username
 
-        langfuse_metadata = self._build_langfuse_metadata(body, __user__)
-        payload["metadata"] = langfuse_metadata
-        if langfuse_metadata.get("trace_user_id"):
-            payload["user_id"] = langfuse_metadata["trace_user_id"]
-
         url = f"{self.valves.HOLMESGPT_URL}/api/chat"
-        headers = self._headers_from_metadata(langfuse_metadata)
+        headers = self._build_trace_headers(body, __user__)
 
         if stream:
             return self._stream(url, payload, headers)
