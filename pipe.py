@@ -29,27 +29,130 @@ class Pipe:
     def pipes(self):
         return [{"id": "holmesgpt", "name": "HolmesGPT"}]
 
-    def _build_trace_headers(self, body: dict, __user__: dict = None) -> dict:
-        """Build Langfuse tracing headers."""
-        trace_id = str(uuid.uuid4())
-        session_id = body.get("chat_id", str(uuid.uuid4()))
+    def _clean_langfuse_value(self, value) -> str | None:
+        """Langfuse session/user values must be US-ASCII strings under 200 chars."""
+        if value is None:
+            return None
 
-        headers = {
-            "trace_id": trace_id,
+        cleaned = str(value).encode("ascii", "ignore").decode("ascii").strip()
+        if not cleaned:
+            return None
+
+        return cleaned[:199]
+
+    def _get_session_id(
+        self,
+        body: dict,
+        __user__: dict | None = None,
+        __chat_id__: str | None = None,
+        __session_id__: str | None = None,
+        __metadata__: dict | None = None,
+    ) -> str:
+        metadata = __metadata__ if isinstance(__metadata__, dict) else {}
+        body_metadata = (
+            body.get("metadata", {}) if isinstance(body.get("metadata"), dict) else {}
+        )
+
+        session_candidates = [
+            __chat_id__,
+            metadata.get("chat_id"),
+            body.get("chat_id"),
+            body_metadata.get("chat_id"),
+            __session_id__,
+            metadata.get("session_id"),
+            body.get("conversation_id"),
+            body.get("session_id"),
+            body.get("id"),
+        ]
+
+        for candidate in session_candidates:
+            cleaned = self._clean_langfuse_value(candidate)
+            if cleaned:
+                return cleaned
+
+        user_id = self._get_user_id(__user__) or "unknown-user"
+        message_id = (
+            self._clean_langfuse_value(body.get("message_id")) or "unknown-message"
+        )
+        return f"openwebui:{user_id}:{message_id}"[:199]
+
+    def _get_user_id(self, __user__: dict | None = None) -> str | None:
+        if not __user__:
+            return None
+
+        for key in ("id", "email", "name", "username"):
+            cleaned = self._clean_langfuse_value(__user__.get(key))
+            if cleaned:
+                return cleaned
+
+        return None
+
+    def _build_langfuse_metadata(
+        self,
+        body: dict,
+        __user__: dict | None = None,
+        __chat_id__: str | None = None,
+        __session_id__: str | None = None,
+        __metadata__: dict | None = None,
+        __message_id__: str | None = None,
+    ) -> dict:
+        session_id = self._get_session_id(
+            body,
+            __user__,
+            __chat_id__,
+            __session_id__,
+            __metadata__,
+        )
+        message_id = self._clean_langfuse_value(
+            __message_id__
+        ) or self._clean_langfuse_value(body.get("message_id"))
+        trace_id = message_id or str(uuid.uuid4())
+
+        metadata = {
             "session_id": session_id,
-            "trace_name": "holmesgpt-chat",
+            "trace_id": trace_id,
+            "trace_name": "openwebui-holmesgpt-chat",
+            "tags": ["openwebui", "holmesgpt"],
+            "trace_metadata": {
+                "source": "openwebui",
+                "pipe": "holmesgpt",
+            },
         }
 
-        if __user__:
-            trace_user_id = (
-                __user__.get("name") or __user__.get("email") or __user__.get("id")
-            )
-            if trace_user_id:
-                headers["trace_user_id"] = trace_user_id
+        user_id = self._get_user_id(__user__)
+        if user_id:
+            metadata["trace_user_id"] = user_id
+
+        if message_id:
+            metadata["trace_metadata"]["openwebui_message_id"] = message_id
+
+        return metadata
+
+    def _build_headers(self, metadata: dict) -> dict:
+        headers = {
+            "X-OpenWebUI-Session-Id": metadata["session_id"],
+            "X-Session-Id": metadata["session_id"],
+            # LiteLLM proxy/Langfuse metadata header form. Some proxies drop
+            # underscore headers, so this is supplemental to the JSON metadata.
+            "langfuse_session_id": metadata["session_id"],
+        }
+
+        trace_user_id = metadata.get("trace_user_id")
+        if trace_user_id:
+            headers["X-OpenWebUI-User-Id"] = trace_user_id
+            headers["langfuse_trace_user_id"] = trace_user_id
 
         return headers
 
-    async def pipe(self, body: dict, __user__: dict = None):
+    async def pipe(
+        self,
+        body: dict,
+        __user__: dict = None,
+        __metadata__: dict = None,
+        __chat_id__: str = None,
+        __session_id__: str = None,
+        __message_id__: str = None,
+    ):
         messages = body.get("messages", [])
         conversation_history = None
 
@@ -69,6 +172,17 @@ class Pipe:
             "model": self.valves.GENERIC_MODEL_NAME,
         }
 
+        langfuse_metadata = self._build_langfuse_metadata(
+            body,
+            __user__,
+            __chat_id__,
+            __session_id__,
+            __metadata__,
+            __message_id__,
+        )
+        payload["metadata"] = langfuse_metadata
+        payload["user_id"] = langfuse_metadata.get("trace_user_id")
+
         if conversation_history:
             if conversation_history[0]["role"] != "system":
                 conversation_history.insert(
@@ -87,7 +201,7 @@ class Pipe:
                 payload["model"] = username
 
         url = f"{self.valves.HOLMESGPT_URL}/api/chat"
-        headers = self._build_trace_headers(body, __user__)
+        headers = self._build_headers(langfuse_metadata)
 
         if stream:
             return self._stream(url, payload, headers)
