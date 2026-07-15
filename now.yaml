@@ -4,6 +4,7 @@ import asyncio
 import aiohttp
 import html
 import json
+import re
 import uuid
 from typing import AsyncGenerator
 from pydantic import BaseModel, Field
@@ -12,6 +13,16 @@ from pydantic import BaseModel, Field
 class Pipe:
     # Safety cap on approval_required -> resume round trips per user turn.
     MAX_APPROVAL_ROUNDS = 5
+
+    # UI-only markup this pipe (and Open WebUI itself) embeds in stored
+    # assistant messages: tool-call/reasoning <details> blocks and raw
+    # <think> tags. These must never be echoed back to HolmesGPT as
+    # conversation history - the LLM wastes tokens on them and starts
+    # reproducing the XML in its answers.
+    UI_BLOCK_RE = re.compile(
+        r"<details\b[^>]*>.*?</details>\s*|<think>.*?</think>\s*",
+        re.DOTALL | re.IGNORECASE,
+    )
 
     class Valves(BaseModel):
         HOLMESGPT_URL: str = Field(
@@ -169,6 +180,35 @@ class Pipe:
 
         return "" if content is None else str(content)
 
+    @classmethod
+    def _strip_ui_blocks(cls, text: str) -> str:
+        return cls.UI_BLOCK_RE.sub("", text).strip()
+
+    async def _emit_status(
+        self,
+        event_emitter,
+        description: str,
+        done: bool = False,
+        hidden: bool = False,
+    ) -> None:
+        """Best-effort Open WebUI status line updates; never breaks the flow."""
+        if not event_emitter:
+            return
+
+        try:
+            await event_emitter(
+                {
+                    "type": "status",
+                    "data": {
+                        "description": description,
+                        "done": done,
+                        "hidden": hidden,
+                    },
+                }
+            )
+        except Exception:
+            pass
+
     async def pipe(
         self,
         body: dict,
@@ -178,6 +218,7 @@ class Pipe:
         __session_id__: str = None,
         __message_id__: str = None,
         __event_call__=None,
+        __event_emitter__=None,
     ):
         messages = body.get("messages", [])
         conversation_history = None
@@ -188,7 +229,9 @@ class Pipe:
                 conversation_history.append(
                     {
                         "role": msg["role"],
-                        "content": self._content_to_text(msg.get("content")),
+                        "content": self._strip_ui_blocks(
+                            self._content_to_text(msg.get("content"))
+                        ),
                     }
                 )
 
@@ -240,9 +283,13 @@ class Pipe:
         headers = self._build_headers(langfuse_metadata)
 
         if stream:
-            return self._stream(url, payload, headers, __event_call__)
+            return self._stream(
+                url, payload, headers, __event_call__, __event_emitter__
+            )
         else:
-            return await self._non_stream(url, payload, headers, __event_call__)
+            return await self._non_stream(
+                url, payload, headers, __event_call__, __event_emitter__
+            )
 
     @staticmethod
     def _describe_pending_approval(approval: dict) -> str:
@@ -394,6 +441,7 @@ class Pipe:
         payload: dict,
         extra_headers: dict = None,
         event_call=None,
+        event_emitter=None,
     ):
         """Handle non-streaming response."""
         timeout = aiohttp.ClientTimeout(total=1800)
@@ -401,6 +449,8 @@ class Pipe:
 
         if extra_headers:
             req_headers.update(extra_headers)
+
+        await self._emit_status(event_emitter, "Asking HolmesGPT...")
 
         try:
             async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -454,6 +504,9 @@ class Pipe:
 
         except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
             return f"⚠️ Connection error while talking to HolmesGPT: {exc}"
+
+        finally:
+            await self._emit_status(event_emitter, "", done=True, hidden=True)
 
     @staticmethod
     def _build_tool_details_block(
@@ -533,6 +586,7 @@ class Pipe:
         payload: dict,
         extra_headers: dict = None,
         event_call=None,
+        event_emitter=None,
     ) -> AsyncGenerator[str, None]:
         """
         Handle streaming response.
@@ -568,6 +622,10 @@ class Pipe:
         last_content = ""
         fallback_error = None
         stream_truncated = False
+
+        # Immediate feedback: without this, a turn with no early reasoning
+        # renders as a bare blinking cursor and feels stuck.
+        await self._emit_status(event_emitter, "Asking HolmesGPT...")
 
         try:
             async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -647,6 +705,11 @@ class Pipe:
                                     if tool_call_id:
                                         pending_tool_starts[tool_call_id] = tool_name
 
+                                    await self._emit_status(
+                                        event_emitter,
+                                        f"Running tool: {tool_name or 'unknown'}...",
+                                    )
+
                                 elif current_event == "tool_calling_result":
                                     (
                                         tool_call_id,
@@ -702,6 +765,9 @@ class Pipe:
                             yield block
 
                         yield str(analysis)
+                        await self._emit_status(
+                            event_emitter, "", done=True, hidden=True
+                        )
                         return
 
                     if analysis is not None:
@@ -732,6 +798,9 @@ class Pipe:
                             yield "<think>"
                             think_open = True
 
+                        await self._emit_status(
+                            event_emitter, "Waiting for tool execution approval..."
+                        )
                         yield "Waiting for tool execution approval...\n\n"
                         decisions = await self._request_tool_approvals(
                             event_call, pending
@@ -740,6 +809,9 @@ class Pipe:
                         yield (
                             f"{approved}/{len(decisions)} tool call(s) approved, "
                             "resuming...\n\n"
+                        )
+                        await self._emit_status(
+                            event_emitter, "Resuming investigation..."
                         )
 
                         current_payload = self._build_resume_payload(
@@ -769,6 +841,8 @@ class Pipe:
 
         # Fallback: every path that didn't return above must still close the
         # thinking block and surface something visible to the user.
+        await self._emit_status(event_emitter, "", done=True, hidden=True)
+
         if think_open:
             yield "</think>\n\n"
 
