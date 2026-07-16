@@ -388,6 +388,33 @@ class Pipe:
 
         return "\n".join(lines)
 
+    @classmethod
+    def _extract_answer_from_history(cls, event_data: dict) -> str:
+        """
+        Recover the final answer from an `ai_answer_end` event whose
+        `analysis` field is empty. Reasoning-style models often return an
+        empty final `content` (the text lands in `reasoning_content`), and
+        Holmes copies that empty content into `analysis` - but the real
+        answer is still in the last assistant message of the
+        `conversation_history` the event carries.
+        """
+        history = event_data.get("conversation_history")
+        if not isinstance(history, list):
+            return ""
+
+        for msg in reversed(history):
+            if not isinstance(msg, dict) or msg.get("role") != "assistant":
+                continue
+
+            text = cls._content_to_text(msg.get("content")).strip()
+            if not text:
+                text = cls._content_to_text(msg.get("reasoning_content")).strip()
+
+            if text:
+                return text
+
+        return ""
+
     @staticmethod
     def _parse_sse_events(text: str) -> dict:
         """
@@ -399,6 +426,7 @@ class Pipe:
             "reasoning": None,
             "content": None,
             "analysis": None,
+            "answer_event": None,
             "error": None,
             "approval": None,
         }
@@ -435,6 +463,7 @@ class Pipe:
 
                 elif current_event == "ai_answer_end":
                     result["analysis"] = event_data.get("analysis")
+                    result["answer_event"] = event_data
                     break
 
             elif line.strip() == "":
@@ -472,10 +501,18 @@ class Pipe:
 
                     parsed = self._parse_sse_events(text)
 
-                    if parsed["analysis"] is not None and str(parsed["analysis"]).strip():
+                    analysis = parsed["analysis"]
+                    if parsed["answer_event"] is not None and (
+                        analysis is None or not str(analysis).strip()
+                    ):
+                        analysis = self._extract_answer_from_history(
+                            parsed["answer_event"]
+                        )
+
+                    if analysis and str(analysis).strip():
                         if parsed["reasoning"]:
-                            return f"{parsed['reasoning']}\n\n{parsed['analysis']}"
-                        return parsed["analysis"]
+                            return f"{parsed['reasoning']}\n\n{analysis}"
+                        return str(analysis)
 
                     if parsed["error"] is not None:
                         message = (
@@ -645,6 +682,7 @@ class Pipe:
 
                 for round_idx in range(self.MAX_APPROVAL_ROUNDS + 1):
                     analysis = None
+                    answer_event = None
                     error_event = None
                     approval_event = None
 
@@ -769,23 +807,40 @@ class Pipe:
 
                                 elif current_event == "ai_answer_end":
                                     analysis = event_data.get("analysis")
+                                    answer_event = event_data
                                     done = True
                                     break
 
                             if done:
                                 break
 
-                    if analysis is not None and str(analysis).strip():
+                    final_answer = None
+                    if answer_event is not None:
+                        if analysis is not None and str(analysis).strip():
+                            final_answer = str(analysis)
+                        else:
+                            # ai_answer_end arrived but with an empty/null
+                            # analysis: recover the answer from the event's
+                            # own conversation_history before giving up.
+                            final_answer = self._extract_answer_from_history(
+                                answer_event
+                            )
+                            if final_answer:
+                                event_trace.append(
+                                    "(answer recovered from history)"
+                                )
+
+                    if final_answer:
                         if think_open:
                             yield "</think>\n\n"
                             think_open = False
 
                         # Flush captured tool calls so the frontend resolver
-                        # can match the placeholders embedded in `analysis`.
+                        # can match the placeholders embedded in the answer.
                         for block in tool_results.values():
                             yield block
 
-                        yield str(analysis)
+                        yield final_answer
                         await self._emit_status(
                             event_emitter, "", done=True, hidden=True
                         )
@@ -797,13 +852,17 @@ class Pipe:
                             )
                         return
 
-                    if analysis is not None:
-                        # ai_answer_end arrived but with an empty analysis:
-                        # fall back to the last intermediate message instead
-                        # of ending the turn with nothing visible.
+                    if answer_event is not None:
+                        # Empty analysis and nothing recoverable: fall back to
+                        # the last intermediate message instead of ending the
+                        # turn with nothing visible.
                         stream_truncated = True
                         empty_analysis = True
-                        event_trace.append("(empty analysis)")
+                        keys = ",".join(
+                            f"{k}={'null' if v is None else len(str(v))}"
+                            for k, v in answer_event.items()
+                        )
+                        event_trace.append(f"(empty analysis; keys: {keys})")
                         break
 
                     if error_event is not None:
