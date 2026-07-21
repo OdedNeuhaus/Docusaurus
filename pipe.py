@@ -831,10 +831,24 @@ class Pipe:
 
                     event_trace.append(f"--round {round_idx + 1}--")
 
+                    # Live DEBUG breadcrumbs: yielded immediately so that even
+                    # a hang leaves a visible trail whose LAST line pinpoints
+                    # where the turn froze (end-of-turn traces never print on
+                    # a hang because the turn never ends).
+                    if self.valves.DEBUG:
+                        has_decisions = "tool_decisions" in current_payload
+                        yield (
+                            f"\n`[dbg]` round {round_idx + 1}: sending request"
+                            f"{' (resume w/ approvals)' if has_decisions else ''}, "
+                            "awaiting HolmesGPT...\n"
+                        )
+
                     async with session.post(
                         url, json=current_payload, headers=req_headers
                     ) as resp:
                         event_trace.append(f"HTTP {resp.status}")
+                        if self.valves.DEBUG:
+                            yield f"\n`[dbg]` round {round_idx + 1}: HTTP {resp.status}, reading stream...\n"
                         resp.raise_for_status()
 
                         buffer = b""
@@ -1039,6 +1053,8 @@ class Pipe:
                             or error_event.get("msg")
                             or "HolmesGPT reported an unknown error"
                         )
+                        if self.valves.DEBUG:
+                            yield f"\n`[dbg]` error event: {fallback_error}\n"
                         break
 
                     if approval_event is not None:
@@ -1058,11 +1074,11 @@ class Pipe:
                         pending_ids.discard(None)
 
                         if self.valves.DEBUG:
-                            event_trace.append(
-                                self._diagnose_resume_integrity(
-                                    approval_event, pending_ids
-                                )
+                            resume_check = self._diagnose_resume_integrity(
+                                approval_event, pending_ids
                             )
+                            event_trace.append(resume_check)
+                            yield f"\n`[dbg]` approval_required for {sorted(pending_ids)}; {resume_check}\n"
 
                         if pending_ids & decided_approval_ids:
                             event_trace.append("(approval loop detected)")
@@ -1093,6 +1109,12 @@ class Pipe:
                             self.valves.APPROVAL_TIMEOUT_SECONDS,
                         )
                         approved = sum(1 for d in decisions if d["approved"])
+                        if self.valves.DEBUG:
+                            yield (
+                                f"\n`[dbg]` dialog answered: approved={approved}/"
+                                f"{len(decisions)}, timed_out={timed_out}; "
+                                "building resume request...\n"
+                            )
                         if timed_out:
                             event_trace.append("(approval timed out -> denied)")
                             yield (
