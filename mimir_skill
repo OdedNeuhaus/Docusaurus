@@ -1,0 +1,126 @@
+---
+name: mimir-debug-diagnose
+user-invocable: true
+description: "Use when a user reports a Grafana Mimir incident, read/write 4XX or 5XX errors, or unusually high read/write latency. Diagnose the issue using dashboards, logs, component correlations, and cluster events. This skill is diagnosis-only and must never change, update, or create anything in the environment."
+---
+
+# Mimir Debugging Diagnosis
+
+## Use this skill when
+
+Use this skill when a user reports:
+- Grafana Mimir read or write incidents
+- 4XX or 5XX errors in the read or write path
+- very high read or write latency
+- suspected infrastructure, network, cache, or query-related degradation in Mimir
+
+## Goal
+
+Produce a structured diagnosis of the incident and recommend the next investigation steps.
+
+This skill is for debugging and diagnosis only.
+
+Do not:
+- restart services
+- scale components
+- edit configs
+- create resources
+- make changes to the environment
+
+## Investigation workflow
+
+Follow this exact order unless the user provides stronger evidence that changes the path.
+
+1. Check dashboards.
+   - Start with the standard Mimir dashboards:
+     - Mimir / Reads
+     - Mimir / Writes
+     - Mimir / Reads Networking
+     - Mimir / Writes Networking
+   - Look for sudden anomalies in latency, sharp drops in successful responses, or unusual peaks during the incident.
+   - Treat a sudden large drop in 2XX responses as a strong infrastructure indicator.
+
+2. Check logs.
+   - Inspect logs for the relevant components in the path of the incident.
+   - For read-path issues, review logs for:
+     - query-frontend
+     - querier
+     - ingesters
+     - store-gateway
+     - index-cache
+     - chunks-cache
+   - For write-path issues, start with vmagent because it is the entrypoint for replication in the active-active Mimir setup.
+   - In Loki, filter by namespace=mimir and look for log lines containing error.
+
+3. Find the problematic components.
+   - Identify which components show the strongest communication failure or latency signatures.
+   - Map the affected path for the incident.
+   - Use logs to separate likely active contributors from components that are merely noisy or indirectly affected.
+
+4. Try to look for correlations.
+   - Check whether the problematic components share the same failure pattern.
+   - Look for grouped failures across components that could point to one shared node, one shared infrastructure segment, or one shared dependency.
+   - If many impacted components fail together, treat the shared node or shared infrastructure as a high-priority clue.
+   - If the problematic components are on different nodes, check whether they sit on the same ESX or the same underlying infrastructure boundary.
+
+5. Look for other errors and events in the cluster.
+   - Review namespace events in the mimir namespace.
+   - Check for worker, network, storage, or node-level events that line up with the timing of the incident.
+   - If there is no obvious node-level issue, inspect cache health and frontend/query behavior for additional signals.
+
+## Decision logic
+
+- If the dashboards show a large latency anomaly and multiple components fail together, suspect a shared infrastructure issue first.
+- If write-path 4XX or 5XX errors are reported, inspect vmagent first.
+- If read-path 4XX or 5XX errors or latency spikes are reported, inspect query-frontend, querier, ingester, store-gateway, and cache components in sequence.
+- If many components on the same node are affected, report the node-level issue as the strongest lead.
+- If the affected components are on different nodes but share the same ESX or storage infrastructure, treat shared infrastructure as a likely suspect.
+- If no clear node problem is found, inspect cache eviction, cache memory pressure, and possible large-query behavior in the query-frontend.
+
+## Evidence to capture
+
+When producing the diagnosis, cite the evidence in this order:
+1. Dashboard anomaly pattern
+2. Component log findings
+3. Correlated problematic components
+4. Node or ESX-level correlation clues
+5. Cluster events and broader error signals
+
+## Output format
+
+Return a structured diagnosis with these sections:
+
+1. Incident summary
+   - What kind of issue is being reported
+   - Whether it appears to be read-path, write-path, or both
+
+2. Evidence observed
+   - Dashboard anomalies
+   - Log findings from the relevant components
+   - Any cluster event or cache signal that appears relevant
+
+3. Component correlation
+   - Which components are impacted
+   - Whether the failures cluster on the same node or same infrastructure boundary
+   - Which communication failures or latency patterns are the strongest clues
+
+4. Likely root-cause hypothesis
+   - Best current explanation based on the evidence
+   - Confidence level
+   - Distinction between probable infrastructure, cache, or query-driven issues
+
+5. Recommended next steps
+   - What to investigate next
+   - Which evidence is still missing
+   - When to escalate to the responsible owner
+
+## Clarifying questions
+
+If the incident report is incomplete or ambiguous, ask a few targeted clarifying questions before giving a final diagnosis.
+
+Ask for:
+- whether the incident is read-path or write-path
+- the exact dashboard anomaly the user sees
+- the time window of the incident
+- whether the problem appears isolated to one node or spread across multiple nodes
+- whether vmagent, cache metrics, query-frontend logs, or namespace events have already been checked
