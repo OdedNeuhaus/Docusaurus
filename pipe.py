@@ -1,26 +1,80 @@
 """HolmesGPT Pipe Function"""
 
+import asyncio
 import aiohttp
 import html
 import json
+import re
 import uuid
 from typing import AsyncGenerator
 from pydantic import BaseModel, Field
 
 
 class Pipe:
+    # Safety cap on approval_required -> resume round trips per user turn.
+    MAX_APPROVAL_ROUNDS = 5
+
+    # UI-only markup this pipe (and Open WebUI itself) embeds in stored
+    # assistant messages: tool-call/reasoning <details> blocks and raw
+    # <think> tags. These must never be echoed back to HolmesGPT as
+    # conversation history - the LLM wastes tokens on them and starts
+    # reproducing the XML in its answers.
+    UI_BLOCK_RE = re.compile(
+        r"<details\b[^>]*>.*?</details>\s*|<think>.*?</think>\s*",
+        re.DOTALL | re.IGNORECASE,
+    )
+
     class Valves(BaseModel):
         HOLMESGPT_URL: str = Field(
             default="http://holmesgpt-holmes",
             description="Base URL of holmesgpt server",
         )
         MODEL_LIST: list[str] = Field(
-            default=["watsonteam", "uscarlet", "uindigo"],
+            default=["watsontcam", "uscarlert", "uindigo"],
             description="HolmesGPT model list",
         )
         GENERIC_MODEL_NAME: str = Field(
             default="generic",
             description="HolmesGPT generic model name",
+        )
+        ADDITIONAL_SYSTEM_PROMPT: str = Field(
+            default="",
+            description=(
+                "Extra system prompt appended to HolmesGPT's own. Useful for "
+                "facts the model cannot discover via tools, e.g. 'The "
+                "configured elasticsearch instances are: prod, staging, ...'"
+            ),
+        )
+        DEBUG: bool = Field(
+            default=False,
+            description=(
+                "Append the SSE event trace to failed responses and log "
+                "it to the Open WebUI console"
+            ),
+        )
+        STALL_TIMEOUT_SECONDS: int = Field(
+            default=120,
+            description=(
+                "Max seconds of silence between SSE chunks before aborting "
+                "with a visible error. Protects against HolmesGPT hanging "
+                "indefinitely (e.g. an unresponsive downstream elasticsearch "
+                "instance). Must be longer than the slowest single tool call, "
+                "since HolmesGPT goes quiet between start_tool_calling and "
+                "tool_calling_result. Lower it for faster failure detection."
+            ),
+        )
+        TOTAL_TIMEOUT_SECONDS: int = Field(
+            default=1800,
+            description="Overall request timeout ceiling, in seconds.",
+        )
+        APPROVAL_TIMEOUT_SECONDS: int = Field(
+            default=180,
+            description=(
+                "Max seconds to wait for a user to answer a tool-approval "
+                "dialog before treating it as denied and resuming. Prevents "
+                "an unanswered dialog (closed tab, unrendered popup) from "
+                "hanging the whole turn forever."
+            ),
         )
 
     def __init__(self):
@@ -80,7 +134,7 @@ class Pipe:
         if not __user__:
             return None
 
-        for key in ("id", "email", "name", "username"):
+        for key in ("email", "name", "username", "id"):
             cleaned = self._clean_langfuse_value(__user__.get(key))
             if cleaned:
                 return cleaned
@@ -103,9 +157,10 @@ class Pipe:
             __session_id__,
             __metadata__,
         )
-        message_id = self._clean_langfuse_value(
-            __message_id__
-        ) or self._clean_langfuse_value(body.get("message_id"))
+        message_id = (
+            self._clean_langfuse_value(__message_id__)
+            or self._clean_langfuse_value(body.get("message_id"))
+        )
         trace_id = message_id or str(uuid.uuid4())
 
         metadata = {
@@ -144,6 +199,55 @@ class Pipe:
 
         return headers
 
+    @staticmethod
+    def _content_to_text(content) -> str:
+        """
+        Open WebUI message content is a plain string for text chats but a
+        list of typed parts for multimodal messages. HolmesGPT expects text.
+        """
+        if isinstance(content, str):
+            return content
+
+        if isinstance(content, list):
+            parts = []
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    parts.append(part.get("text", ""))
+                elif isinstance(part, str):
+                    parts.append(part)
+            return "\n".join(p for p in parts if p)
+
+        return "" if content is None else str(content)
+
+    @classmethod
+    def _strip_ui_blocks(cls, text: str) -> str:
+        return cls.UI_BLOCK_RE.sub("", text).strip()
+
+    async def _emit_status(
+        self,
+        event_emitter,
+        description: str,
+        done: bool = False,
+        hidden: bool = False,
+    ) -> None:
+        """Best-effort Open WebUI status line updates; never breaks the flow."""
+        if not event_emitter:
+            return
+
+        try:
+            await event_emitter(
+                {
+                    "type": "status",
+                    "data": {
+                        "description": description,
+                        "done": done,
+                        "hidden": hidden,
+                    },
+                }
+            )
+        except Exception:
+            pass
+
     async def pipe(
         self,
         body: dict,
@@ -152,6 +256,8 @@ class Pipe:
         __chat_id__: str = None,
         __session_id__: str = None,
         __message_id__: str = None,
+        __event_call__=None,
+        __event_emitter__=None,
     ):
         messages = body.get("messages", [])
         conversation_history = None
@@ -160,10 +266,15 @@ class Pipe:
             conversation_history = []
             for msg in messages[:-1]:
                 conversation_history.append(
-                    {"role": msg["role"], "content": msg["content"]}
+                    {
+                        "role": msg["role"],
+                        "content": self._strip_ui_blocks(
+                            self._content_to_text(msg.get("content"))
+                        ),
+                    }
                 )
 
-        ask = messages[-1]["content"] if messages else ""
+        ask = self._content_to_text(messages[-1].get("content")) if messages else ""
         stream = body.get("stream", False)
 
         payload = {
@@ -196,76 +307,314 @@ class Pipe:
             payload["conversation_history"] = conversation_history
 
         if __user__:
-            username = __user__.get("email").split("@")[0]
+            username = __user__.get("email", "").split("@")[0]
             if username in self.valves.MODEL_LIST:
                 payload["model"] = username
+
+        if self.valves.ADDITIONAL_SYSTEM_PROMPT.strip():
+            payload["additional_system_prompt"] = (
+                self.valves.ADDITIONAL_SYSTEM_PROMPT.strip()
+            )
+
+        # Only ask HolmesGPT to pause for tool approval when we actually have
+        # a UI channel (__event_call__) to relay the question to the user.
+        # Without it, Holmes keeps its default behavior: approval-gated tools
+        # fail back into the LLM so it can self-correct.
+        if __event_call__:
+            payload["enable_tool_approval"] = True
 
         url = f"{self.valves.HOLMESGPT_URL}/api/chat"
         headers = self._build_headers(langfuse_metadata)
 
         if stream:
-            return self._stream(url, payload, headers)
+            return self._stream(
+                url, payload, headers, __event_call__, __event_emitter__
+            )
         else:
-            return await self._non_stream(url, payload, headers)
+            return await self._non_stream(
+                url, payload, headers, __event_call__, __event_emitter__
+            )
+
+    @staticmethod
+    def _describe_pending_approval(approval: dict) -> str:
+        description = approval.get("description")
+        if description:
+            return str(description)
+
+        params = approval.get("params") or approval.get("arguments") or {}
+        try:
+            return json.dumps(params, ensure_ascii=False)
+        except (TypeError, ValueError):
+            return str(params)
+
+    async def _request_tool_approvals(
+        self,
+        event_call,
+        pending_approvals: list,
+        timeout_seconds: float = 180,
+    ) -> tuple[list[dict], bool]:
+        """
+        Show one Open WebUI confirmation dialog per pending tool call and
+        translate the answers into HolmesGPT `tool_decisions`.
+
+        Returns (decisions, timed_out). Each dialog is bounded by
+        `timeout_seconds`: an unanswered dialog (user closed the tab, popup
+        never rendered) must never hang the turn, so on timeout the tool is
+        treated as denied and we move on. Denial is also the safe default for
+        a dialog the user never consciously approved.
+        """
+        decisions = []
+        timed_out = False
+
+        for approval in pending_approvals:
+            if not isinstance(approval, dict):
+                continue
+
+            tool_call_id = approval.get("tool_call_id") or approval.get("id") or ""
+            if not tool_call_id:
+                continue
+
+            tool_name = approval.get("tool_name") or approval.get("name") or "tool"
+
+            approved = False
+            try:
+                response = await asyncio.wait_for(
+                    event_call(
+                        {
+                            "type": "confirmation",
+                            "data": {
+                                "title": f"HolmesGPT wants to run: {tool_name}",
+                                "message": self._describe_pending_approval(approval),
+                            },
+                        }
+                    ),
+                    timeout=timeout_seconds,
+                )
+                approved = bool(response)
+            except asyncio.TimeoutError:
+                timed_out = True
+                approved = False
+            except Exception:
+                approved = False
+
+            decisions.append({"tool_call_id": tool_call_id, "approved": approved})
+
+        return decisions, timed_out
+
+    @staticmethod
+    def _build_resume_payload(
+        base_payload: dict,
+        approval_event: dict,
+        decisions: list[dict],
+    ) -> dict:
+        """
+        HolmesGPT resumes a paused run when `ask` is empty and both the
+        `conversation_history` from the approval_required event and
+        `tool_decisions` are present (server-side `resume_only` mode).
+        """
+        resume = dict(base_payload)
+        resume["ask"] = ""
+        resume["conversation_history"] = (
+            approval_event.get("conversation_history") or []
+        )
+        resume["tool_decisions"] = decisions
+        return resume
+
+    @staticmethod
+    def _format_pending_approvals_message(pending_approvals: list) -> str:
+        lines = [
+            "HolmesGPT needs approval to run the following tools, "
+            "but no approval dialog is available in this context:",
+            "",
+        ]
+        for approval in pending_approvals or []:
+            if not isinstance(approval, dict):
+                continue
+            tool_name = approval.get("tool_name") or approval.get("name") or "tool"
+            description = approval.get("description") or ""
+            lines.append(f"- **{tool_name}** {description}".rstrip())
+
+        if len(lines) == 2:
+            lines.append("- (no tool details provided)")
+
+        return "\n".join(lines)
+
+    @classmethod
+    def _extract_answer_from_history(cls, event_data: dict) -> str:
+        """
+        Recover the final answer from an `ai_answer_end` event whose
+        `analysis` field is empty. Reasoning-style models often return an
+        empty final `content` (the text lands in `reasoning_content`), and
+        Holmes copies that empty content into `analysis` - but the real
+        answer is still in the last assistant message of the
+        `conversation_history` the event carries.
+        """
+        history = event_data.get("conversation_history")
+        if not isinstance(history, list):
+            return ""
+
+        for msg in reversed(history):
+            if not isinstance(msg, dict) or msg.get("role") != "assistant":
+                continue
+
+            text = cls._content_to_text(msg.get("content")).strip()
+            if not text:
+                text = cls._content_to_text(msg.get("reasoning_content")).strip()
+
+            if text:
+                return text
+
+        return ""
+
+    @staticmethod
+    def _parse_sse_events(text: str) -> dict:
+        """
+        Parse a complete HolmesGPT SSE response body into its terminal
+        outcome. `error` / `approval_required` / `ai_answer_end` all end the
+        stream, so parsing stops at the first one seen.
+        """
+        result = {
+            "reasoning": None,
+            "content": None,
+            "analysis": None,
+            "answer_event": None,
+            "error": None,
+            "approval": None,
+        }
+        current_event = None
+
+        for line in text.split("\n"):
+            if line.startswith("event: "):
+                current_event = line[7:].strip()
+
+            elif line.startswith("data: "):
+                data = line[6:].strip()
+
+                if data == "[DONE]":
+                    break
+
+                try:
+                    event_data = json.loads(data)
+                except json.JSONDecodeError:
+                    continue
+
+                if current_event == "ai_message":
+                    result["reasoning"] = (
+                        event_data.get("reasoning") or result["reasoning"]
+                    )
+                    result["content"] = event_data.get("content") or result["content"]
+
+                elif current_event == "error":
+                    result["error"] = event_data
+                    break
+
+                elif current_event == "approval_required":
+                    result["approval"] = event_data
+                    break
+
+                elif current_event == "ai_answer_end":
+                    result["analysis"] = event_data.get("analysis")
+                    result["answer_event"] = event_data
+                    break
+
+            elif line.strip() == "":
+                current_event = None
+
+        return result
 
     async def _non_stream(
         self,
         url: str,
         payload: dict,
         extra_headers: dict = None,
+        event_call=None,
+        event_emitter=None,
     ):
         """Handle non-streaming response."""
-        timeout = aiohttp.ClientTimeout(total=1800)
+        timeout = aiohttp.ClientTimeout(
+            total=self.valves.TOTAL_TIMEOUT_SECONDS,
+            sock_read=self.valves.STALL_TIMEOUT_SECONDS,
+        )
         req_headers = {"Content-Type": "application/json"}
 
         if extra_headers:
             req_headers.update(extra_headers)
 
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(url, json=payload, headers=req_headers) as resp:
-                resp.raise_for_status()
+        await self._emit_status(event_emitter, "Asking HolmesGPT...")
 
-                text = await resp.text()
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                current_payload = payload
 
-                reasoning = None
-                analysis = None
-                current_event = None
+                for _ in range(self.MAX_APPROVAL_ROUNDS + 1):
+                    async with session.post(
+                        url, json=current_payload, headers=req_headers
+                    ) as resp:
+                        resp.raise_for_status()
+                        text = await resp.text()
 
-                lines = text.split("\n")
+                    parsed = self._parse_sse_events(text)
 
-                for line in lines:
-                    if line and line.startswith("event: "):
-                        current_event = line[7:].strip()
+                    analysis = parsed["analysis"]
+                    if parsed["answer_event"] is not None and (
+                        analysis is None or not str(analysis).strip()
+                    ):
+                        analysis = self._extract_answer_from_history(
+                            parsed["answer_event"]
+                        )
 
-                    elif line and line.startswith("data: "):
-                        data = line[6:].strip()
+                    if analysis and str(analysis).strip():
+                        if parsed["reasoning"]:
+                            return f"{parsed['reasoning']}\n\n{analysis}"
+                        return str(analysis)
 
-                        if data == "[DONE]":
-                            break
+                    if parsed["error"] is not None:
+                        message = (
+                            parsed["error"].get("description")
+                            or parsed["error"].get("msg")
+                            or "unknown error"
+                        )
+                        return f"⚠️ HolmesGPT returned an error: {message}"
 
-                        try:
-                            event_data = json.loads(data)
+                    approval_event = parsed["approval"]
+                    if approval_event is not None:
+                        pending = approval_event.get("pending_approvals") or []
 
-                            if current_event == "ai_message":
-                                reasoning = event_data.get("reasoning", "")
-
-                            elif current_event == "ai_answer_end":
-                                analysis = event_data.get("analysis")
-                                break
-
-                        except json.JSONDecodeError:
+                        if pending and event_call:
+                            decisions, _ = await self._request_tool_approvals(
+                                event_call,
+                                pending,
+                                self.valves.APPROVAL_TIMEOUT_SECONDS,
+                            )
+                            current_payload = self._build_resume_payload(
+                                payload, approval_event, decisions
+                            )
                             continue
 
-                    elif line.strip() == "":
-                        current_event = None
+                        return self._format_pending_approvals_message(pending)
 
-                if analysis:
-                    if reasoning:
-                        return f"{reasoning}\n\n{analysis}"
+                    # No terminal event at all: fall back to the last
+                    # intermediate assistant message if there was one.
+                    if parsed["content"]:
+                        return parsed["content"]
 
-                    return analysis
+                    return "Error: No analysis found in HolmesGPT response"
 
-                return "Error: No analysis found in HolmesGPT response"
+                return "⚠️ Tool approval limit reached without a final answer"
+
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            if isinstance(exc, asyncio.TimeoutError) or isinstance(
+                exc, aiohttp.ServerTimeoutError
+            ):
+                return (
+                    "⚠️ HolmesGPT stopped responding mid-request (no data "
+                    f"for {self.valves.STALL_TIMEOUT_SECONDS}s). It may be "
+                    "stuck on an unresponsive tool or downstream service."
+                )
+            return f"⚠️ Connection error while talking to HolmesGPT: {exc}"
+
+        finally:
+            await self._emit_status(event_emitter, "", done=True, hidden=True)
 
     @staticmethod
     def _build_tool_details_block(
@@ -286,7 +635,7 @@ class Pipe:
 
         # serialize_output() in open-webui wraps `result_text` once via
         # json.dumps so that the attribute is always a JSON string. Mirror
-        # that here so the holmesPromql resolver's `parseMaybeJSON` loop
+        # that here so the HolmesPromql resolver's `parseMaybeJSON` loop
         # double-unwraps the same way it does for native flows.
         try:
             result_attr = json.dumps(result_text or "", ensure_ascii=False)
@@ -306,7 +655,7 @@ class Pipe:
     @staticmethod
     def _extract_tool_call_output(event_data: dict) -> tuple[str, str, dict, str]:
         """
-        Pull out (tool_call_id, tool_name, params, stringifyed_result)
+        Pull out (tool_call_id, tool_name, params, stringified_result)
         from a HolmesGPT `tool_calling_result` SSE event payload.
         """
         tool_call_id = event_data.get("tool_call_id") or event_data.get("id") or ""
@@ -344,119 +693,395 @@ class Pipe:
         url: str,
         payload: dict,
         extra_headers: dict = None,
+        event_call=None,
+        event_emitter=None,
     ) -> AsyncGenerator[str, None]:
         """
         Handle streaming response.
 
-        Captures HolmesGPT's tool_calling_result SSE events and surfaces them
+        Captures HolmesGPT's `tool_calling_result` SSE events and surfaces them
         to Open WebUI as inline `<details type="tool_calls">` blocks so the
-        frontend PromQL graph resolver can match the embedded `<<{{...}}>>`
-        placeholders by tool_call_id.
+        frontend PromQL graph resolver can match the embedded `<<...>>`
+        placeholders by `tool_call_id`.
+
+        HolmesGPT ends a stream with exactly one of `ai_answer_end`, `error`,
+        or `approval_required` (or drops the connection). Every one of those
+        paths must close the `<think>` block, otherwise Open WebUI renders a
+        permanent empty "thinking" state.
+
+        `sock_read` bounds the *gap* between chunks, not the whole request,
+        so a HolmesGPT-side hang (e.g. an unresponsive downstream tool with
+        no query timeout of its own) surfaces as a clear error within
+        STALL_TIMEOUT_SECONDS instead of leaving the user staring at a
+        spinner for up to TOTAL_TIMEOUT_SECONDS.
         """
-        timeout = aiohttp.ClientTimeout(total=1800)
+        timeout = aiohttp.ClientTimeout(
+            total=self.valves.TOTAL_TIMEOUT_SECONDS,
+            sock_read=self.valves.STALL_TIMEOUT_SECONDS,
+        )
         req_headers = {"Content-Type": "application/json"}
 
         if extra_headers:
             req_headers.update(extra_headers)
 
         # Accumulate tool results until we're ready to flush them after
-        # </think>. Order is preserved via insertion order of the dict.
+        # `</think>`. Order is preserved via insertion order of the dict.
         tool_results: dict[str, str] = {}
 
         # Track tool_name from start_tool_calling so we can fall back if the
         # result event omits it.
         pending_tool_starts: dict[str, str] = {}
 
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(url, json=payload, headers=req_headers) as resp:
-                resp.raise_for_status()
+        # Open <think> lazily, only once there is actual reasoning content to
+        # put inside it. An empty (or never-closed) think block is what makes
+        # Open WebUI render a permanently spinning "Thinking..." state.
+        think_open = False
+        last_content = ""
+        fallback_error = None
+        stream_truncated = False
+        empty_analysis = False
 
-                buffer = b""
-                current_event = None
-                thinking = True
+        # Chronological record of what the server actually sent, so failures
+        # are diagnosable from the UI (DEBUG valve) or container logs.
+        event_trace: list[str] = []
 
-                yield "<think>"
+        # Immediate feedback: without this, a turn with no early reasoning
+        # renders as a bare blinking cursor and feels stuck.
+        await self._emit_status(event_emitter, "Asking HolmesGPT...")
 
-                async for chunk in resp.content.iter_any():
-                    buffer += chunk
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                current_payload = payload
 
-                    while b"\n" in buffer:
-                        line_bytes, buffer = buffer.split(b"\n", 1)
-                        line = line_bytes.decode("utf-8").strip()
+                for round_idx in range(self.MAX_APPROVAL_ROUNDS + 1):
+                    analysis = None
+                    answer_event = None
+                    error_event = None
+                    approval_event = None
 
-                        if not line:
-                            current_event = None
-                            continue
+                    event_trace.append(f"--round {round_idx + 1}--")
 
-                        if line.startswith("event: "):
-                            current_event = line[7:].strip()
+                    async with session.post(
+                        url, json=current_payload, headers=req_headers
+                    ) as resp:
+                        event_trace.append(f"HTTP {resp.status}")
+                        resp.raise_for_status()
 
-                        elif line.startswith("data: "):
-                            chunk_data = line[6:].strip()
+                        buffer = b""
+                        current_event = None
+                        done = False
 
-                            if chunk_data == "[DONE]":
-                                break
+                        async for chunk in resp.content.iter_any():
+                            buffer += chunk
 
-                            try:
-                                event_data = json.loads(chunk_data)
-                            except json.JSONDecodeError:
-                                continue
+                            while b"\n" in buffer:
+                                line_bytes, buffer = buffer.split(b"\n", 1)
+                                line = line_bytes.decode(
+                                    "utf-8", errors="replace"
+                                ).strip()
 
-                            if current_event == "ai_message":
-                                reasoning = event_data.get("reasoning", "")
-
-                                if reasoning and thinking:
-                                    yield f"{reasoning}\n\n"
-
-                            elif current_event == "start_tool_calling":
-                                tool_name = event_data.get("tool_name", "")
-                                tool_call_id = (
-                                    event_data.get("id")
-                                    or event_data.get("tool_call_id")
-                                    or ""
-                                )
-
-                                if tool_call_id:
-                                    pending_tool_starts[tool_call_id] = tool_name
-
-                            elif current_event == "tool_calling_result":
-                                (
-                                    tool_call_id,
-                                    tool_name,
-                                    params,
-                                    result_text,
-                                ) = self._extract_tool_call_output(event_data)
-
-                                if not tool_call_id:
+                                if not line:
+                                    current_event = None
                                     continue
 
-                                tool_name = tool_name or pending_tool_starts.get(
-                                    tool_call_id,
-                                    "",
-                                )
-                                pending_tool_starts.pop(tool_call_id, None)
+                                if line.startswith("event: "):
+                                    current_event = line[7:].strip()
+                                    continue
 
-                                tool_results[tool_call_id] = (
-                                    self._build_tool_details_block(
+                                if not line.startswith("data: "):
+                                    continue
+
+                                chunk_data = line[6:].strip()
+
+                                if chunk_data == "[DONE]":
+                                    event_trace.append("[DONE]")
+                                    done = True
+                                    break
+
+                                event_trace.append(
+                                    f"{current_event or '?'}:{len(chunk_data)}b"
+                                )
+
+                                try:
+                                    event_data = json.loads(chunk_data)
+                                except json.JSONDecodeError:
+                                    event_trace.append("(json-decode-failed)")
+                                    continue
+
+                                if current_event == "token_count":
+                                    # Usage numbers reveal max_tokens
+                                    # truncation without needing access to
+                                    # the LLM server or tracing backend.
+                                    try:
+                                        event_trace.append(
+                                            "tokens:"
+                                            + json.dumps(
+                                                event_data,
+                                                separators=(",", ":"),
+                                            )[:300]
+                                        )
+                                    except (TypeError, ValueError):
+                                        pass
+
+                                elif current_event == "ai_message":
+                                    reasoning = event_data.get("reasoning") or ""
+                                    content = event_data.get("content") or ""
+
+                                    if reasoning:
+                                        if not think_open:
+                                            yield "<think>"
+                                            think_open = True
+                                        yield f"{reasoning}\n\n"
+
+                                    if content:
+                                        last_content = content
+                                        if content != reasoning:
+                                            if not think_open:
+                                                yield "<think>"
+                                                think_open = True
+                                            yield f"{content}\n\n"
+
+                                elif current_event == "start_tool_calling":
+                                    tool_name = event_data.get("tool_name", "")
+                                    tool_call_id = (
+                                        event_data.get("id")
+                                        or event_data.get("tool_call_id")
+                                        or ""
+                                    )
+
+                                    if tool_call_id:
+                                        pending_tool_starts[tool_call_id] = tool_name
+
+                                    await self._emit_status(
+                                        event_emitter,
+                                        f"Running tool: {tool_name or 'unknown'}...",
+                                    )
+
+                                elif current_event == "tool_calling_result":
+                                    (
                                         tool_call_id,
                                         tool_name,
                                         params,
                                         result_text,
+                                    ) = self._extract_tool_call_output(event_data)
+
+                                    if not tool_call_id:
+                                        continue
+
+                                    tool_name = tool_name or pending_tool_starts.get(
+                                        tool_call_id,
+                                        "",
                                     )
+                                    pending_tool_starts.pop(tool_call_id, None)
+
+                                    tool_results[tool_call_id] = (
+                                        self._build_tool_details_block(
+                                            tool_call_id,
+                                            tool_name,
+                                            params,
+                                            result_text,
+                                        )
+                                    )
+
+                                elif current_event == "error":
+                                    error_event = event_data
+                                    done = True
+                                    break
+
+                                elif current_event == "approval_required":
+                                    approval_event = event_data
+                                    done = True
+                                    break
+
+                                elif current_event == "ai_answer_end":
+                                    analysis = event_data.get("analysis")
+                                    answer_event = event_data
+                                    done = True
+                                    break
+
+                            if done:
+                                break
+
+                    final_answer = None
+                    if answer_event is not None:
+                        if analysis is not None and str(analysis).strip():
+                            final_answer = str(analysis)
+                        else:
+                            # ai_answer_end arrived but with an empty/null
+                            # analysis: recover the answer from the event's
+                            # own conversation_history before giving up.
+                            final_answer = self._extract_answer_from_history(
+                                answer_event
+                            )
+                            if final_answer:
+                                event_trace.append(
+                                    "(answer recovered from history)"
                                 )
 
-                            elif current_event == "ai_answer_end":
-                                analysis = event_data.get("analysis")
+                    if final_answer:
+                        if think_open:
+                            yield "</think>\n\n"
+                            think_open = False
 
-                                if analysis is not None:
-                                    thinking = False
-                                    yield "</think>\n\n"
+                        # Flush captured tool calls so the frontend resolver
+                        # can match the placeholders embedded in the answer.
+                        for block in tool_results.values():
+                            yield block
 
-                                    # Flush captured tool calls so the
-                                    # frontend resolver can match the
-                                    # placeholders embedded in `analysis`.
-                                    for block in tool_results.values():
-                                        yield block
+                        yield final_answer
+                        await self._emit_status(
+                            event_emitter, "", done=True, hidden=True
+                        )
 
-                                    yield analysis
-                                    return
+                        if self.valves.DEBUG:
+                            print(
+                                "[holmesgpt-pipe] success, trace: "
+                                + " ".join(event_trace)
+                            )
+                        return
+
+                    if answer_event is not None:
+                        # Empty analysis and nothing recoverable: fall back to
+                        # the last intermediate message instead of ending the
+                        # turn with nothing visible.
+                        stream_truncated = True
+                        empty_analysis = True
+                        keys = ",".join(
+                            f"{k}={'null' if v is None else len(str(v))}"
+                            for k, v in answer_event.items()
+                        )
+                        event_trace.append(f"(empty analysis; keys: {keys})")
+                        try:
+                            event_trace.append(
+                                "answer-metadata:"
+                                + json.dumps(
+                                    answer_event.get("metadata"),
+                                    separators=(",", ":"),
+                                )[:400]
+                            )
+                        except (TypeError, ValueError):
+                            pass
+                        break
+
+                    if error_event is not None:
+                        fallback_error = (
+                            error_event.get("description")
+                            or error_event.get("msg")
+                            or "HolmesGPT reported an unknown error"
+                        )
+                        break
+
+                    if approval_event is not None:
+                        pending = approval_event.get("pending_approvals") or []
+
+                        if not pending or not event_call:
+                            fallback_error = self._format_pending_approvals_message(
+                                pending
+                            )
+                            break
+
+                        if not think_open:
+                            yield "<think>"
+                            think_open = True
+
+                        await self._emit_status(
+                            event_emitter, "Waiting for tool execution approval..."
+                        )
+                        yield "Waiting for tool execution approval...\n\n"
+                        decisions, timed_out = await self._request_tool_approvals(
+                            event_call,
+                            pending,
+                            self.valves.APPROVAL_TIMEOUT_SECONDS,
+                        )
+                        approved = sum(1 for d in decisions if d["approved"])
+                        if timed_out:
+                            event_trace.append("(approval timed out -> denied)")
+                            yield (
+                                "No response to the approval prompt in "
+                                f"{self.valves.APPROVAL_TIMEOUT_SECONDS}s; "
+                                "treating as denied and continuing.\n\n"
+                            )
+                        yield (
+                            f"{approved}/{len(decisions)} tool call(s) approved, "
+                            "resuming...\n\n"
+                        )
+                        await self._emit_status(
+                            event_emitter, "Resuming investigation..."
+                        )
+
+                        current_payload = self._build_resume_payload(
+                            payload, approval_event, decisions
+                        )
+                        continue
+
+                    # Stream ended without any terminal event (server hiccup
+                    # or truncated response).
+                    stream_truncated = True
+                    break
+
+                else:
+                    fallback_error = (
+                        "Tool approval limit reached without a final answer"
+                    )
+
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            if isinstance(exc, asyncio.TimeoutError) or isinstance(
+                exc, aiohttp.ServerTimeoutError
+            ):
+                fallback_error = (
+                    "HolmesGPT stopped responding mid-request (no data for "
+                    f"{self.valves.STALL_TIMEOUT_SECONDS}s). It may be stuck "
+                    "on an unresponsive tool or downstream service."
+                )
+            else:
+                fallback_error = (
+                    f"Connection error while talking to HolmesGPT: {exc}"
+                )
+            event_trace.append(f"(exception: {type(exc).__name__})")
+
+        except Exception as exc:  # noqa: BLE001 - a raised exception here
+            # would end the message with an unclosed <think> block, which
+            # Open WebUI renders as a permanently spinning "Thinking...".
+            fallback_error = (
+                f"Unexpected error in HolmesGPT pipe: {type(exc).__name__}: {exc}"
+            )
+            event_trace.append(f"(exception: {type(exc).__name__})")
+
+        # Fallback: every path that didn't return above must still close the
+        # thinking block and surface something visible to the user.
+        await self._emit_status(event_emitter, "", done=True, hidden=True)
+
+        if self.valves.DEBUG:
+            print(f"[holmesgpt-pipe] fallback, trace: {' '.join(event_trace)}")
+
+        if think_open:
+            yield "</think>\n\n"
+
+        for block in tool_results.values():
+            yield block
+
+        if fallback_error:
+            yield f"⚠️ {fallback_error}"
+        elif last_content:
+            yield last_content
+            if stream_truncated:
+                yield (
+                    "\n\n*(HolmesGPT ended the stream without a final "
+                    "analysis — the answer above may be incomplete.)*"
+                )
+        elif empty_analysis:
+            yield (
+                "⚠️ HolmesGPT finished the investigation but returned an "
+                "empty answer."
+            )
+        else:
+            yield (
+                "⚠️ HolmesGPT stream ended without a final answer. "
+                "Please try asking again."
+            )
+
+        if self.valves.DEBUG:
+            yield (
+                "\n\n---\n`debug trace:` "
+                + " ".join(event_trace[-80:])
+            )
