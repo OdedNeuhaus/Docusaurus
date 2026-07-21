@@ -68,12 +68,21 @@ class Pipe:
             description="Overall request timeout ceiling, in seconds.",
         )
         APPROVAL_TIMEOUT_SECONDS: int = Field(
-            default=180,
+            default=120,
             description=(
                 "Max seconds to wait for a user to answer a tool-approval "
                 "dialog before treating it as denied and resuming. Prevents "
                 "an unanswered dialog (closed tab, unrendered popup) from "
                 "hanging the whole turn forever."
+            ),
+        )
+        ENABLE_TOOL_APPROVAL: bool = Field(
+            default=True,
+            description=(
+                "Master switch for the interactive tool-approval flow. Turn "
+                "OFF if approval dialogs do not render in your Open WebUI "
+                "client: HolmesGPT then auto-errors approval-gated tools and "
+                "self-corrects instead, which avoids approval loops entirely."
             ),
         )
 
@@ -317,10 +326,11 @@ class Pipe:
             )
 
         # Only ask HolmesGPT to pause for tool approval when we actually have
-        # a UI channel (__event_call__) to relay the question to the user.
-        # Without it, Holmes keeps its default behavior: approval-gated tools
-        # fail back into the LLM so it can self-correct.
-        if __event_call__:
+        # a UI channel (__event_call__) to relay the question to the user AND
+        # the feature is enabled. Without it, Holmes keeps its default
+        # behavior: approval-gated tools fail back into the LLM so it can
+        # self-correct.
+        if __event_call__ and self.valves.ENABLE_TOOL_APPROVAL:
             payload["enable_tool_approval"] = True
 
         url = f"{self.valves.HOLMESGPT_URL}/api/chat"
@@ -400,6 +410,40 @@ class Pipe:
             decisions.append({"tool_call_id": tool_call_id, "approved": approved})
 
         return decisions, timed_out
+
+    @staticmethod
+    def _diagnose_resume_integrity(approval_event: dict, pending_ids: set) -> str:
+        """
+        DEBUG helper. HolmesGPT can only execute an approved tool on resume if
+        the conversation_history we send back still contains the assistant
+        tool_call with matching id AND its `pending_approval` / `approval_token`
+        markers. If those are missing, `_execute_tool_decisions` raises
+        "no pending approvals found in conversation history". This reports
+        whether the round-trip will actually work.
+        """
+        history = approval_event.get("conversation_history")
+        if not isinstance(history, list):
+            return f"resume-check: NO conversation_history (type={type(history).__name__})"
+
+        found = {}
+        for msg in history:
+            if not isinstance(msg, dict) or msg.get("role") != "assistant":
+                continue
+            for tc in msg.get("tool_calls") or []:
+                if not isinstance(tc, dict):
+                    continue
+                tc_id = tc.get("id")
+                if tc_id in pending_ids:
+                    found[tc_id] = (
+                        f"pending_approval={tc.get('pending_approval')},"
+                        f"has_token={'approval_token' in tc}"
+                    )
+
+        missing = pending_ids - set(found)
+        return (
+            f"resume-check: history_len={len(history)} "
+            f"found={found} missing_ids={sorted(str(m) for m in missing)}"
+        )
 
     @staticmethod
     def _build_resume_payload(
@@ -542,6 +586,8 @@ class Pipe:
 
         await self._emit_status(event_emitter, "Asking HolmesGPT...")
 
+        decided_approval_ids: set = set()
+
         try:
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 current_payload = payload
@@ -581,6 +627,24 @@ class Pipe:
                         pending = approval_event.get("pending_approvals") or []
 
                         if pending and event_call:
+                            pending_ids = {
+                                (a.get("tool_call_id") or a.get("id"))
+                                for a in pending
+                                if isinstance(a, dict)
+                            }
+                            pending_ids.discard(None)
+
+                            if pending_ids & decided_approval_ids:
+                                return (
+                                    "⚠️ HolmesGPT kept asking to approve the "
+                                    "same tool after a decision was already "
+                                    "sent, so the pipe stopped to avoid a "
+                                    "loop. The approval dialog may not be "
+                                    "reaching you; consider disabling "
+                                    "ENABLE_TOOL_APPROVAL on the pipe."
+                                )
+
+                            decided_approval_ids |= pending_ids
                             decisions, _ = await self._request_tool_approvals(
                                 event_call,
                                 pending,
@@ -748,6 +812,12 @@ class Pipe:
         # Immediate feedback: without this, a turn with no early reasoning
         # renders as a bare blinking cursor and feels stuck.
         await self._emit_status(event_emitter, "Asking HolmesGPT...")
+
+        # tool_call_ids we have already returned a decision for. If HolmesGPT
+        # asks us to approve one of these again, the run is not converging
+        # (e.g. an unrendered dialog auto-denies and the model keeps retrying
+        # the same tool) - bail instead of looping until MAX_APPROVAL_ROUNDS.
+        decided_approval_ids: set = set()
 
         try:
             async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -979,6 +1049,35 @@ class Pipe:
                                 pending
                             )
                             break
+
+                        pending_ids = {
+                            (a.get("tool_call_id") or a.get("id"))
+                            for a in pending
+                            if isinstance(a, dict)
+                        }
+                        pending_ids.discard(None)
+
+                        if self.valves.DEBUG:
+                            event_trace.append(
+                                self._diagnose_resume_integrity(
+                                    approval_event, pending_ids
+                                )
+                            )
+
+                        if pending_ids & decided_approval_ids:
+                            event_trace.append("(approval loop detected)")
+                            fallback_error = (
+                                "HolmesGPT kept asking to approve the same "
+                                "tool after a decision was already sent, so "
+                                "the pipe stopped to avoid a loop. This "
+                                "usually means the approval dialog is not "
+                                "reaching you. Ask an admin to disable "
+                                "ENABLE_TOOL_APPROVAL on the HolmesGPT pipe, "
+                                "or retry without an approval-gated action."
+                            )
+                            break
+
+                        decided_approval_ids |= pending_ids
 
                         if not think_open:
                             yield "<think>"
